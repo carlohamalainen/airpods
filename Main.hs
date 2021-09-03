@@ -164,6 +164,9 @@ setAirPodsVolume device volume = S.exe
 setVolume :: Int -> IO ()
 setVolume airpodIndex = S.exe "pacmd" "set-sink-volume" (show airpodIndex) "20000"
 
+setDefaultSink :: Int -> IO ()
+setDefaultSink airpodIndex = S.exe "pacmd" "set-default-sink" (show airpodIndex)
+
 getInputs :: IO [Int]
 getInputs = do
     inputs <- S.exe "pacmd" "list-sink-inputs" |> S.capture
@@ -256,3 +259,5 @@ main = do
     setAirPodsVolume h 90 
 
     setVolume airpodIndex
+
+    setDefaultSink airpodIndex
