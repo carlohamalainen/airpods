@@ -240,7 +240,10 @@ main = do
             (MacAddress m:_) -> return m
             _ -> ioError $ userError $ usageInfo header options
 
+    putStrLn $ "::: Disconnecting " <> mac
     disconnect mac
+
+    putStrLn $ "::: Connecting " <> mac
     connect    mac
 
     threadDelay $ 3 * 1000000
@@ -249,6 +252,7 @@ main = do
 
     airpodIndex <- getAirpod mac
 
+    putStrLn $ "::: Moving inputs for " <> mac <> " at index " <> show airpodIndex
     moveInputs airpodIndex inputs
 
     let f ':' = '_'
@@ -256,8 +260,11 @@ main = do
 
     h <- getHciDev $ map f mac
 
+    putStrLn "::: Setting AirPods internal volume"
     setAirPodsVolume h 90 
 
+    putStrLn "::: Setting AirPods main volume"
     setVolume airpodIndex
 
+    putStrLn "::: Setting AirPods as default sink"
     setDefaultSink airpodIndex
