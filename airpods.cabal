@@ -20,7 +20,7 @@ executable airpods
   main-is:             Main.hs
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >=4.13 && <4.14
+  build-depends:       base
                      , parsec
                      , shh
   -- hs-source-dirs:

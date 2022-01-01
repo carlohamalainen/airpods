@@ -4,10 +4,12 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Main (main) where
 
 import Prelude
+import Data.Foldable
 import Control.Monad
 import Data.Char (digitToInt)
 import Text.Parsec
@@ -28,13 +30,15 @@ data SinkLine
 data Device = Device Int [SinkLine]
   deriving Show
 
-number :: Stream s m Char => ParsecT s u m Int
+type Parse t = forall s m. Stream s m Char => ParsecT s () m t
+
+number :: Parse Int
 number = number' <$> many1 digit
   where
     number' :: Integral i => String -> i
     number' = foldl (\x -> ((10*x) +) . fromIntegral . digitToInt) 0
 
-pSinksAvailable :: Stream s m Char => ParsecT s u m Int
+pSinksAvailable :: Parse Int
 pSinksAvailable = do
     nrSinks <- number
     void $ string " sink(s) available."
@@ -42,7 +46,7 @@ pSinksAvailable = do
 
     return nrSinks
 
-pSinkInputsAvailable :: Stream s m Char => ParsecT s u m Int
+pSinkInputsAvailable :: Parse Int
 pSinkInputsAvailable = do
     nrSinks <- number
     void $ string " sink input(s) available."
@@ -50,7 +54,7 @@ pSinkInputsAvailable = do
 
     return nrSinks
 
-pIndex :: Stream s m Char => ParsecT s u m Int
+pIndex :: Parse Int
 pIndex = do
     void $ manyTill anyChar (try $ string "index: ")
     n <- number
@@ -58,7 +62,7 @@ pIndex = do
 
     return n
 
-pOtherLine :: Stream s m Char => ParsecT s u m SinkLine
+pOtherLine :: Parse SinkLine
 pOtherLine = do
     void $ many1 tab
     xs <- manyTill anyChar $ lookAhead endOfLine
@@ -66,7 +70,7 @@ pOtherLine = do
 
     return $ Other xs
 
-pDeviceLine :: Stream s m Char => ParsecT s u m SinkLine
+pDeviceLine :: Parse SinkLine
 pDeviceLine = do
     void $ many1 tab
     void $ string "device.string = \""
@@ -76,14 +80,10 @@ pDeviceLine = do
 
     return $ Mac mac
 
-pDevice :: Stream s m Char => ParsecT s u m Device
-pDevice = do
-    i  <- pIndex
-    xs <- many1 (try pDeviceLine <|> try pOtherLine)
+pDevice :: Parse Device
+pDevice = Device <$> pIndex <*> many1 (try pDeviceLine <|> try pOtherLine)
 
-    return $ Device i xs
-
-pSinkInputs :: Stream s m Char => ParsecT s u m [Int]
+pSinkInputs :: Parse [Int]
 pSinkInputs = do
     n <- pSinkInputsAvailable
     replicateM n $ do
@@ -93,7 +93,7 @@ pSinkInputs = do
         void endOfLine
         return i
 
-pDevices :: Stream s m Char => ParsecT s u m [Device]
+pDevices :: Parse [Device]
 pDevices = do
     n <- pSinksAvailable
     replicateM n pDevice
@@ -116,17 +116,16 @@ connect mac = do
     unless (x == 0) $ error $
         "Connect failed: " <> show x
 
-pLine :: Stream s m Char => ParsecT s u m (Maybe String)
+pLine :: Parse (Maybe String)
 pLine = do
     void $ manyTill anyChar $ lookAhead endOfLine
     void endOfLine
     return Nothing
 
-pHciDev :: Stream s m Char => String -> ParsecT s u m (Maybe String)
-pHciDev mac = foldl mplus Nothing
-           <$> many1 (try pHciDev' <|> pLine)
+pHciDev :: String -> Parse (Maybe String)
+pHciDev mac = asum <$> many1 (try pHciDev' <|> pLine)
   where
-    pHciDev' :: Stream s m Char => ParsecT s u m (Maybe String)
+    pHciDev' :: Parse (Maybe String)
     pHciDev' = do
         void $ many1 space
 
@@ -136,14 +135,17 @@ pHciDev mac = foldl mplus Nothing
 
         mac' <- string mac
 
-        void $ string "/fd"
+        void $ string "/"
+        sep <- manyTill anyChar (try $ char '/')
+        void $ string "fd"
 
         n' <- number
 
         void $ string "\""
 
         return $ Just $
-            "/org/bluez/hci" <> show n <> "/dev_" <> mac' <> "/fd" <> show n'
+            "/org/bluez/hci" <> show n <> "/dev_" <> mac' 
+            <> "/" <> sep <> "/fd" <> show n'
 
 -- Set the internal volume of the AirPods. This requires a patched bluez!
 -- 
@@ -185,7 +187,7 @@ getAirpod mac = do
 
     case x of
         Left err -> error $ "Failed to parse an AirPod: " <> show err
-        Right x' -> return $ case foldl mplus Nothing $ map f x' of
+        Right x' -> return $ case asum $ map f x' of
             Nothing -> error "No AirPods found"
             Just i  -> i
 
@@ -210,20 +212,21 @@ getHciDev mac_ = do
             "org.freedesktop.DBus.ObjectManager.GetManagedObjects"
         |> S.capture 
    
-    Right (Just h) <- runParserT (pHciDev mac_) () "hci" x
+    h <- runParserT (pHciDev mac_) () "hci" x
 
-    return h
+    case h of
+        Left err -> error $ show err
+        Right Nothing -> error "empty parse in getHciDev"
+        Right (Just h') -> return h'
 
 newtype Flag = MacAddress String
   deriving Show
 
 options :: [OptDescr Flag]
-options =
-    [ Option ['m'] ["mac"] (ReqArg MacAddress "MAC ADDRESS") "MAC address of your AirPods"
-    ]
+options = [ Option ['m'] ["mac"] (ReqArg MacAddress "MAC ADDRESS") "MAC address of your AirPods" ]
 
-compilerOpts :: [String] -> IO [Flag]
-compilerOpts argv =
+airpodOpts :: [String] -> IO [Flag]
+airpodOpts argv =
   case getOpt Permute options argv of
      (o, _n, []  ) -> return o
      (_, _,  errs) -> ioError (userError (concat errs ++ usageInfo header options))
@@ -234,7 +237,7 @@ header = "Usage: airpods <OPTION>"
 main :: IO ()
 main = do
     argv <- getArgs
-    opts <- compilerOpts argv
+    opts <- airpodOpts argv
 
     mac <- case opts of
             (MacAddress m:_) -> return m
