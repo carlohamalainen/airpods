@@ -21,10 +21,11 @@ executable airpods
   -- other-modules:
   -- other-extensions:
   build-depends:       base
-                     , parsec
-                     , shh
-  -- hs-source-dirs:
-  default-language:    Haskell2010
+                     , shh >= 0.7.2.2
+                     , aeson
+                     , lens
+                     , lens-aeson
+                     , text
 
   -- For details on warnings: https://downloads.haskell.org/~ghc/master/users-guide/using-warnings.html
   -- This list taken from https://medium.com/mercury-bank/enable-all-the-warnings-a0517bc081c3

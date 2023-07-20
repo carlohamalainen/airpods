@@ -1,108 +1,55 @@
-{-# OPTIONS -Wall                   #-}
-{-# OPTIONS -Wno-name-shadowing     #-}
-
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
 
 module Main (main) where
+
+{-# OPTIONS_GHC -Wno-missing-safe-haskell-mode #-}
+
+import Data.Kind
 
 import Prelude
 import Data.Foldable
 import Control.Monad
-import Data.Char (digitToInt)
-import Text.Parsec
+
+import Data.Text qualified as T
+import Data.List qualified as List
+
+import Control.Lens
+import Data.Aeson
+import Data.Aeson.Key
+import Data.Aeson.KeyMap qualified as KeyMap
 
 import Control.Concurrent (threadDelay)
 
-import qualified Shh as S
+import Shh qualified as S
 import           Shh ((|>))
 
 import System.Console.GetOpt
 import System.Environment
+import Data.Aeson.Lens
 
-data SinkLine
-    = Mac String
-    | Other String
-  deriving (Eq, Show)
-
-data Device = Device Int [SinkLine]
-  deriving Show
-
-type Parse t = forall s m. Stream s m Char => ParsecT s () m t
-
-number :: Parse Int
-number = number' <$> many1 digit
-  where
-    number' :: Integral i => String -> i
-    number' = foldl (\x -> ((10*x) +) . fromIntegral . digitToInt) 0
-
-pSinksAvailable :: Parse Int
-pSinksAvailable = do
-    nrSinks <- number
-    void $ string " sink(s) available."
-    void endOfLine
-
-    return nrSinks
-
-pSinkInputsAvailable :: Parse Int
-pSinkInputsAvailable = do
-    nrSinks <- number
-    void $ string " sink input(s) available."
-    void endOfLine
-
-    return nrSinks
-
-pIndex :: Parse Int
-pIndex = do
-    void $ manyTill anyChar (try $ string "index: ")
-    n <- number
-    void endOfLine
-
-    return n
-
-pOtherLine :: Parse SinkLine
-pOtherLine = do
-    void $ many1 tab
-    xs <- manyTill anyChar $ lookAhead endOfLine
-    void endOfLine
-
-    return $ Other xs
-
-pDeviceLine :: Parse SinkLine
-pDeviceLine = do
-    void $ many1 tab
-    void $ string "device.string = \""
-    mac <- manyTill anyChar $ lookAhead (string "\"")
-    void $ string "\""
-    void endOfLine
-
-    return $ Mac mac
-
-pDevice :: Parse Device
-pDevice = Device <$> pIndex <*> many1 (try pDeviceLine <|> try pOtherLine)
-
-pSinkInputs :: Parse [Int]
-pSinkInputs = do
-    n <- pSinkInputsAvailable
-    replicateM n $ do
-        i <- pIndex
-        void $ many1 tab
-        void $ manyTill anyChar $ lookAhead endOfLine
-        void endOfLine
-        return i
-
-pDevices :: Parse [Device]
-pDevices = do
-    n <- pSinksAvailable
-    replicateM n pDevice
-
-moveInputs :: Int -> [Int] -> IO ()
+moveInputs :: Integer -> [Integer] -> IO ()
 moveInputs airpodIndex sinks
     = forM_ sinks $ \s -> do
         print ("move-sink-input", s, "==>", airpodIndex)
-        S.exe "pacmd" "move-sink-input" (show s) (show airpodIndex)
+        S.exe "pactl" "move-sink-input" (show s) (show airpodIndex)
+
+restartBluetooth :: IO ()
+restartBluetooth = do
+    x <- S.exitCode $ S.exe "sudo" "systemctl" "disable" "bluetooth"
+    unless (x == 0) $ error $
+        "enable bluetooth failed: " <> show x
+
+    x <- S.exitCode $ S.exe "sudo" "systemctl" "enable" "bluetooth"
+    unless (x == 0) $ error $
+        "enable bluetooth failed: " <> show x
+
+    x <- S.exitCode $ S.exe "sudo" "systemctl" "restart" "bluetooth"
+    unless (x == 0) $ error $
+        "restart bluetooth failed: " <> show x
 
 disconnect :: String -> IO ()
 disconnect mac = do
@@ -110,45 +57,20 @@ disconnect mac = do
     unless (x == 0) $ error $
         "Disconnect failed: " <> show x
 
+trust :: String -> IO ()
+trust mac = do
+    x <- S.exitCode $ S.exe "bluetoothctl" "trust" mac
+    unless (x == 0) $ error $
+        "Connect failed: " <> show x
+
 connect :: String -> IO ()
 connect mac = do
     x <- S.exitCode $ S.exe "bluetoothctl" "connect" mac
     unless (x == 0) $ error $
         "Connect failed: " <> show x
 
-pLine :: Parse (Maybe String)
-pLine = do
-    void $ manyTill anyChar $ lookAhead endOfLine
-    void endOfLine
-    return Nothing
-
-pHciDev :: String -> Parse (Maybe String)
-pHciDev mac = asum <$> many1 (try pHciDev' <|> pLine)
-  where
-    pHciDev' :: Parse (Maybe String)
-    pHciDev' = do
-        void $ many1 space
-
-        void $ string "object path \"/org/bluez/hci"
-        n  <- number
-        void $ string "/dev_"
-
-        mac' <- string mac
-
-        void $ string "/"
-        sep <- manyTill anyChar (try $ char '/')
-        void $ string "fd"
-
-        n' <- number
-
-        void $ string "\""
-
-        return $ Just $
-            "/org/bluez/hci" <> show n <> "/dev_" <> mac' 
-            <> "/" <> sep <> "/fd" <> show n'
-
 -- Set the internal volume of the AirPods. This requires a patched bluez!
--- 
+--
 -- https://carlo-hamalainen.net/2021/05/20/airpods
 --
 setAirPodsVolume :: String -> Int -> IO ()
@@ -163,61 +85,79 @@ setAirPodsVolume device volume = S.exe
     "string:Volume"
     ("variant:uint16:" <> show volume)
 
-setVolume :: Int -> IO ()
-setVolume airpodIndex = S.exe "pacmd" "set-sink-volume" (show airpodIndex) "20000"
+setVolume :: Integer -> IO ()
+setVolume airpodIndex = S.exe "pactl" "set-sink-volume" (show airpodIndex) "20000" -- 20%
 
-setDefaultSink :: Int -> IO ()
-setDefaultSink airpodIndex = S.exe "pacmd" "set-default-sink" (show airpodIndex)
+setDefaultSink :: Integer -> IO ()
+setDefaultSink airpodIndex = S.exe "pactl" "set-default-sink" (show airpodIndex)
 
-getInputs :: IO [Int]
+getInputs :: IO [Integer]
 getInputs = do
-    inputs <- S.exe "pacmd" "list-sink-inputs" |> S.capture
+    inputs <- S.exe "pactl" "-f" "json" "list" "sink-inputs" Shh.|> S.capture
 
-    inputs <- runParserT pSinkInputs () "sink_inputs" inputs
+    case eitherDecode inputs of
+        Left err -> error err
+        Right (j::Value) -> do
+            return $ j ^.. _Array . each . key (fromString "index") . _Integer
 
-    return $ case inputs of
-        Left  _   -> []
-        Right ixs -> ixs
-
-getAirpod :: (S.Shell m, MonadFail m) => [Char] -> m Int
+getAirpod :: (S.Shell m, Monad m) => String -> m (Either String Integer)
 getAirpod mac = do
-    x <- S.exe "pacmd" "list-sinks" |> S.capture
+    x <- S.exe "pactl" "-f" "json" "list" "sinks" Shh.|> S.capture
 
-    x <- runParserT pDevices () "foo" x
+    case eitherDecode x of
+        Left err -> return $ Left err
+        Right (j::Value) -> do
 
-    case x of
-        Left err -> error $ "Failed to parse an AirPod: " <> show err
-        Right x' -> return $ case asum $ map f x' of
-            Nothing -> error "No AirPods found"
-            Just i  -> i
+            let xs :: [Value]
+                xs = j ^.. _Array . each
 
-  where
+                fff :: Value -> Bool
+                fff v = Just (T.pack mac) == v ^? key (fromString "properties") . key (fromString "device.string") . _String
 
-    f (Device i slines)
-        = case filter matchMac slines of
-            [] -> Nothing
-            _  -> Just i
+                xs' :: [Value]
+                xs' = xs ^.. each . filtered fff
 
-    matchMac = \case Mac m -> m == mac
-                     _     -> False
+                air :: Maybe Integer
+                air = xs' ^? each . key (fromString "index") . _Integer
+
+            return $ case air of
+                        Nothing -> Left $ "No match for " <> mac
+                        Just x  -> Right x
 
 getHciDev :: (S.Shell m, MonadFail m) => String -> m String
-getHciDev mac_ = do
+getHciDev mac = do
     x <- S.exe
-            "dbus-send" 
-            "--print-reply"
-            "--system" 
-            "--dest=org.bluez"
+            "busctl"
+            "call"
+            "org.bluez"
             "/"
-            "org.freedesktop.DBus.ObjectManager.GetManagedObjects"
-        |> S.capture 
-   
-    h <- runParserT (pHciDev mac_) () "hci" x
+            "org.freedesktop.DBus.ObjectManager"
+            "GetManagedObjects"
+            "--json"
+            "pretty"
+        Shh.|> S.capture
 
-    case h of
-        Left err -> error $ show err
-        Right Nothing -> error "empty parse in getHciDev"
-        Right (Just h') -> return h'
+    let isFD s = "fd" == s ^. reversed . to (take 3) . to (drop 1) . reversed
+
+        isMAC s = map f mac `List.isInfixOf` s
+          where
+            f ':' = '_'
+            f  c  = c
+
+    case eitherDecode x of
+        Left err -> error err
+        Right (j::Value) -> do
+            let j' = j ^? key (fromString "data")
+                   . _Array . each . _Object
+                   . to (KeyMap.filterWithKey (\k _v -> let k' = toString k in isFD k' && isMAC k'))
+
+                h = j' ^? _Just . to KeyMap.toList . _head . _1 . to toString
+
+            case h of
+                Nothing -> error $ "Could not find HCI device info in " <> show j
+                Just h' -> return h'
+
+type Flag :: Type
 
 newtype Flag = MacAddress String
   deriving Show
@@ -234,6 +174,17 @@ airpodOpts argv =
 header :: String
 header = "Usage: airpods <OPTION>"
 
+retryM :: [Int] -> IO (Either a b) -> IO b
+retryM [] _ = error "too many retries"
+retryM (s:ss) f = do
+    x <- f
+
+    case x of
+        Right x' -> return x'
+        Left _ -> do
+            threadDelay $ s * 1000000
+            retryM ss f
+
 main :: IO ()
 main = do
     argv <- getArgs
@@ -243,28 +194,36 @@ main = do
             (MacAddress m:_) -> return m
             _ -> ioError $ userError $ usageInfo header options
 
+    restartBluetooth
+    threadDelay $ 3 * 1000000
+
     putStrLn $ "::: Disconnecting " <> mac
     disconnect mac
 
+    putStrLn $ "::: Trusting " <> mac
+    trust mac
+
     putStrLn $ "::: Connecting " <> mac
-    connect    mac
+    connect mac
 
     threadDelay $ 3 * 1000000
 
+
+    airpodIndex <- retryM [1, 2, 3, 5, 7] (getAirpod mac)
+
+    putStrLn $ "Found Airpod with index " <> show airpodIndex
+
     inputs <- getInputs
 
-    airpodIndex <- getAirpod mac
+    print inputs
 
     putStrLn $ "::: Moving inputs for " <> mac <> " at index " <> show airpodIndex
     moveInputs airpodIndex inputs
 
-    let f ':' = '_'
-        f  c  = c
-
-    h <- getHciDev $ map f mac
+    h <- getHciDev mac
 
     putStrLn "::: Setting AirPods internal volume"
-    setAirPodsVolume h 90 
+    setAirPodsVolume h 90
 
     putStrLn "::: Setting AirPods main volume"
     setVolume airpodIndex
